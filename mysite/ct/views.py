@@ -3,7 +3,7 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth import logout
 from django.utils.safestring import mark_safe
 from django.utils import timezone
-from django.http import HttpResponseRedirect, HttpResponse
+from django.http import HttpResponseRedirect, HttpResponse, Http404
 from django.core.urlresolvers import reverse
 from django.core.exceptions import ObjectDoesNotExist
 from django.views.decorators.csrf import ensure_csrf_cookie
@@ -121,17 +121,16 @@ class PageData(object):
         self.fsmStack = FSMStack(request)
         for k,v in kwargs.items():
             setattr(self, k, v)
+        try:
+            self.statusMessage = request.session['statusMessage']
+            del request.session['statusMessage']
+        except KeyError:
+            pass
     def fsm_redirect(self, request, eventName=None, defaultURL=None,
                      addNextButton=False, **kwargs):
         'check whether fsm intercepts this event and returns redirect'
         if not self.fsmStack.state: # no FSM running, so nothing to do
             return defaultURL and HttpResponseRedirect(defaultURL)
-        if not eventName and addNextButton: # must supply Next form
-            if request.method == 'POST':
-                eventName = 'next' # tell FSM this is next event
-            else:
-                self.nextForm = NextForm()
-                set_crispy_action(request.path, self.nextForm)
         # now we check here whether event is actually from path matching
         # this node
         referer = request.META.get('HTTP_REFERER', '')
@@ -139,6 +138,30 @@ class PageData(object):
         if request.method == 'POST' and referer != self.fsmStack.state.path:
             r = None # don't even call FSM with POST events from other pages.
         else: # event from current node's page
+            if not eventName: # handle Next and Select POST requests
+                if request.method == 'POST':
+                    task = request.POST.get('task', '')
+                    if 'next' == task:
+                        eventName = 'next' # tell FSM this is next event
+                    elif task.startswith('select_'):
+                        className = task[7:]
+                        attr = className[0].lower() + className[1:]
+                        try:
+                            klass = klassNameDict[className]
+                            selectID = int(request.POST['selectID'])
+                        except (KeyError,ValueError):
+                            return HttpResponse('bad select', status=400)
+                        eventName = task # pass event and object to FSM
+                        kwargs[attr] = get_object_or_404(klass, pk=selectID)
+                    elif not task:
+                        return HttpResponse('''POST not processed by view?
+                                               null eventName''', status=400)
+                    else:
+                        return HttpResponse('invalid fsm task: %s' % task,
+                                            status=400)
+                elif addNextButton: # must supply Next form
+                    self.nextForm = NextForm()
+                    set_crispy_action(request.path, self.nextForm)
             r = self.fsmStack.event(request, eventName, defaultURL=defaultURL,
                                     **kwargs)
         if r: # let FSM override the default URL
@@ -1215,55 +1238,68 @@ def ul_respond(request, course_id, unit_id, ul_id):
     return pageData.render(request, 'ct/ask.html',
                   dict(unitLesson=ul, qtext=md2html(ul.lesson.text), form=form))
 
+def get_answer_html(unitLesson):
+    'get HTML text for answer associated with this lesson, if any'
+    try:
+        answer = unitLesson.get_answers()[0]
+    except IndexError:
+        return '(author has not provided an answer)'
+    else:
+        return md2html(answer.lesson.text)
+
+
 @login_required
-def assess(request, course_id, unit_id, ul_id, resp_id, doSelfEval=True,
-           redirectURL=None):
+def assess(request, course_id, unit_id, ul_id, resp_id):
     'student self-assessment'
     unit, ul, _, pageData = ul_page_data(request, unit_id, ul_id, 'Study')
     r = get_object_or_404(Response, pk=resp_id)
-    allErrors = list(r.unitLesson.get_errors()) + unit.get_aborts()
-    choices = [(e.id, e.lesson.title) for e in allErrors]
-    if doSelfEval:
-        formClass = SelfAssessForm
-    else:
-        formClass = AssessErrorsForm
     if request.method == 'POST':
-        form = formClass(request.POST)
-        form.fields['emlist'].choices = choices
+        form = SelfAssessForm(request.POST)
         if form.is_valid():
-            if doSelfEval:
-                r.selfeval = form.cleaned_data['selfeval']
-                r.status = form.cleaned_data['status']
-                r.save()
-                if form.cleaned_data['liked']:
-                    liked = Liked(unitLesson=r.unitLesson,
-                                  addedBy=request.user)
-                    liked.save()
-            for emID in form.cleaned_data['emlist']:
-                em = get_object_or_404(UnitLesson, pk=emID)
-                se = r.studenterror_set.create(errorModel=em,
-                    author=request.user, status=form.cleaned_data['status'])
-            if not redirectURL: # default: go to next lesson
-                redirectURL = lesson_next_url(request, r.unitLesson)
-            return pageData.fsm_redirect(request, 'next', redirectURL)
+            r.selfeval = form.cleaned_data['selfeval']
+            r.status = form.cleaned_data['status']
+            r.save()
+            if form.cleaned_data['liked']:
+                liked = Liked(unitLesson=r.unitLesson,
+                              addedBy=request.user)
+                liked.save()
+            if r.selfeval == Response.CORRECT: # just go on to next lesson
+                eventName = 'next'
+                defaultURL = lesson_next_url(request, r.unitLesson)
+            else: # ask student to assess their errors
+                eventName = 'error' # student made an error
+                defaultURL = reverse('ct:assess_errors',
+                    args=(course_id, unit_id, ul_id, resp_id))
+            return pageData.fsm_redirect(request, eventName, defaultURL)
     else:
-        form = formClass()
-        form.fields['emlist'].choices = choices
-    try:
-        answer = r.unitLesson.get_answers()[0]
-    except IndexError:
-        answer = '(author has not provided an answer)'
-    else:
-        answer = md2html(answer.lesson.text)
+        form = SelfAssessForm()
+    answer = get_answer_html(r.unitLesson)
+    set_crispy_action(request.path, form)
     return pageData.render(request, 'ct/assess.html',
-                  dict(response=r, answer=answer, form=form,
-                       doSelfEval=doSelfEval))
+                dict(response=r, answer=answer, assessForm=form,
+                     showAnswer=True))
 
+@login_required
 def assess_errors(request, course_id, unit_id, ul_id, resp_id):
-    ul = get_object_or_404(UnitLesson, pk=ul_id)
-    redirectURL = get_object_url(request.path, ul, subpath='tasks')
-    return assess(request, course_id, unit_id, ul_id, resp_id, False,
-           redirectURL)
+    'classify error(s) in a given student response'
+    unit, ul, _, pageData = ul_page_data(request, unit_id, ul_id, 'Study')
+    r = get_object_or_404(Response, pk=resp_id)
+    allErrors = list(r.unitLesson.get_errors()) + unit.get_aborts()
+    if request.method == 'POST' and 'emlist' in request.POST:
+        if request.user == r.author:
+            status = r.status
+        else:
+            status = NEED_REVIEW_STATUS
+        for emID in request.POST.getlist('emlist', []):
+            em = get_object_or_404(UnitLesson, pk=int(emID))
+            se = r.studenterror_set.create(errorModel=em, author=request.user,
+                                           status=status)
+        defaultURL = get_object_url(request.path, ul, subpath='tasks')
+        return pageData.fsm_redirect(request, 'next', defaultURL)
+    answer = get_answer_html(r.unitLesson)
+    return pageData.render(request, 'ct/assess.html',
+                dict(response=r, answer=answer, errorModels=allErrors,
+                     showAnswer=False))
 
 ###############################################################
 # FSM user interface
@@ -1283,4 +1319,30 @@ def fsm_node(request, node_id):
 def fsm_status(request):
     'display Activity Center UI'
     pageData = PageData(request)
-    return pageData.render(request, 'ct/fsm_status.html')
+    if request.method == 'POST':
+        if 'fsmstate_id' in request.POST:
+            try:
+                url = pageData.fsmStack.resume(request,
+                                               request.POST['fsmstate_id'])
+            except FSMBadUserError:
+                pageData.errorMessage = 'Cannot access activity belonging to another user'
+            except FSMStackResumeError:
+                pageData.errorMessage = 'This activity is waiting for a sub-activity to complete, and hence cannot be resumed (you should complete or cancel the sub-activity first).'
+            except FSMState.DoesNotExist:
+                pageData.errorMessage = 'Activity not found!'
+            else: # redirect to this activity
+                return HttpResponseRedirect(url)
+        elif not pageData.fsmStack.state:
+            pageData.errorMessage = 'No activity ongoing currently!'
+        elif 'abort' == request.POST.get('task', None):
+            pageData.fsmStack.pop(request, eventName='abort')
+            pageData.statusMessage = 'Activity canceled.'
+    if not pageData.fsmStack.state: # search for unfinished activities
+        unfinished = FSMState.objects.filter(user=request.user,
+                                             children__isnull=True)
+    else:
+        unfinished = None
+    cancelForm = CancelForm()
+    set_crispy_action(request.path, cancelForm)
+    return pageData.render(request, 'ct/fsm_status.html',
+                           dict(cancelForm=cancelForm, unfinished=unfinished))

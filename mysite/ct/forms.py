@@ -2,7 +2,7 @@ from django import forms
 from ct.models import Response, Course, Unit, Concept, Lesson, ConceptLink, ConceptGraph, STATUS_CHOICES, StudentError
 from django.utils.translation import ugettext_lazy as _
 from crispy_forms.helper import FormHelper
-from crispy_forms.layout import Submit, Layout
+from crispy_forms.layout import Submit, Layout, Field
 ## from crispy_forms.bootstrap import StrictButton
 
 
@@ -39,18 +39,24 @@ class ErrorStatusForm(ResponseForm):
         labels = dict(status=_('How well have you overcome this error?'))
         
 class SelfAssessForm(forms.Form):
-    selfeval = forms.ChoiceField(choices=(('', '----'),) + Response.EVAL_CHOICES)
-    status = forms.ChoiceField(choices=(('', '----'),) + STATUS_CHOICES)
+    selfeval = forms.ChoiceField(choices=(('', '----'),) + Response.EVAL_CHOICES,
+                label='How does this answer compare with the right answer?')
+    status = forms.ChoiceField(choices=(('', '----'),) + STATUS_CHOICES,
+                label='How well do you feel you understand this concept now?')
     liked = forms.BooleanField(required=False,
                 label='''Check here if this lesson really showed
                 you something you were missing before.''')
-    emlist = forms.MultipleChoiceField(widget=forms.CheckboxSelectMultiple,
-                                       required=False)
+    def __init__(self, *args, **kwargs):
+        super(SelfAssessForm, self).__init__(*args, **kwargs)
+        self.helper = FormHelper(self)
+        self.helper.form_id = 'id-selfAssessForm'
+        self.helper.form_class = 'form-vertical'
+        self.helper.form_method = 'post'
+        self.helper.add_input(Submit('submit', 'Next'))
 
 class AssessErrorsForm(forms.Form):
-    status = forms.ChoiceField(choices=(('', '----'),) + STATUS_CHOICES)
     emlist = forms.MultipleChoiceField(widget=forms.CheckboxSelectMultiple,
-                                       required=False)
+                                       required=False, label='Common errors')
 
 class ReorderForm(forms.Form):
     newOrder = forms.ChoiceField()
@@ -76,6 +82,7 @@ class NextLikeForm(forms.Form):
     
 
 class NextForm(forms.Form):
+    task = forms.CharField(initial='next', widget=forms.HiddenInput)
     def __init__(self, *args, **kwargs):
         super(NextForm, self).__init__(*args, **kwargs)
         self.helper = FormHelper(self)
@@ -262,6 +269,15 @@ class LogoutForm(forms.Form):
         self.helper.form_id = 'id-logoutForm'
         self.helper.form_class = 'form-vertical'
         self.helper.add_input(Submit('submit', 'Sign out'))
+
+class CancelForm(forms.Form):
+    task = forms.CharField(initial='abort', widget=forms.HiddenInput)
+    def __init__(self, *args, **kwargs):
+        super(CancelForm, self).__init__(*args, **kwargs)
+        self.helper = FormHelper(self)
+        self.helper.form_id = 'id-cancelForm'
+        self.helper.form_class = 'form-vertical'
+        self.helper.add_input(Submit('submit', 'Cancel this activity'))
 
 
 ###############################################################
